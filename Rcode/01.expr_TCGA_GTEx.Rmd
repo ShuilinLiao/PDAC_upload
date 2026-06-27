@@ -1,0 +1,555 @@
+---
+title: "P1_limma_DEGs.Rmd"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(data.table)
+library(tibble)
+library(tidyverse)
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(patchwork)
+library(ggpubr)
+rm(list = ls())
+```
+
+# load data
+```{r}
+expr_file  <- "TCGA-GTEx-TARGET-gene-exp-counts.deseq2-normalized.log2"
+pheno_file <- "TcgaTargetGTEX_phenotype.txt"
+indir <- "/disk/user/liaoshuilin/project/25.ExoMolePAAD/data/UCSCXenaProject/"
+outdir <- "/disk/user/liaoshuilin/project/25.ExoMolePAAD/Result/Exp/"
+outdir2 <- "/disk/user/liaoshuilin/project/25.ExoMolePAAD/Result/JiaBo/"
+probe_file <- "probeMap_gencode.v23.annotation.gene.probemap"
+```
+
+# 1. 根据 phenotype 选择样本
+```{r}
+pheno <- fread(paste(indir, pheno_file, sep = ""), data.table = FALSE)
+sample_col <- grep("sample|Sample|sampleID|SampleID", colnames(pheno), value = TRUE)[1]
+pheno$sample <- pheno[[sample_col]]
+pheno$all_info <- apply(pheno, 1, function(x) paste(x, collapse = " "))
+
+## TCGA-PAAD 样本
+tcga_paad <- pheno %>%
+  filter(
+    grepl("^TCGA", sample),
+    grepl("PAAD|pancreatic|Pancreatic|pancreas|Pancreas", all_info)
+  )
+
+## GTEx pancreas normal
+gtex_pancreas <- pheno %>%
+  filter(
+    grepl("^GTEX", sample),
+    grepl("pancreas|Pancreas", all_info))
+
+## 根据 TCGA barcode 判断样本类型
+## 01 = Primary Tumor
+## 11 = Solid Tissue Normal / NAT
+tcga_paad$sample_code <- substr(tcga_paad$sample, 14, 15)
+tcga_tumor <- tcga_paad %>% filter(sample_code == "01")
+tcga_nat <- tcga_paad %>% filter(sample_code == "11")
+gtex_normal <- gtex_pancreas
+
+## 合并 metadata
+meta <- bind_rows(
+  data.frame(sample = tcga_tumor$sample,
+             group = "Tumor",
+             source = "TCGA",
+             subtype = "TCGA_Tumor"),
+  data.frame(sample = tcga_nat$sample,
+             group = "Normal",
+             source = "TCGA",
+             subtype = "TCGA_NAT"),
+  data.frame(sample = gtex_normal$sample,
+             group = "Normal",
+             source = "GTEx",
+             subtype = "GTEx_Normal"))
+
+meta <- meta[!duplicated(meta$sample), ]
+rownames(meta) <- meta$sample
+
+table(meta$subtype)
+table(meta$source, meta$group)
+
+meta$group  <- factor(meta$group, levels = c("Normal", "Tumor"))
+meta$source <- factor(meta$source, levels = c("GTEx", "TCGA"))
+
+write.csv(meta, file.path(outdir2, "1exp/PAAD_TCGA_GTEx_metadata.csv"))
+```
+
+# 2. 读取表达矩阵
+```{r}
+expr <- fread(paste(indir, expr_file, sep = ""), data.table = FALSE)
+gene_col <- colnames(expr)[1]
+expr <- expr %>% column_to_rownames(gene_col)
+expr <- as.matrix(expr)
+mode(expr) <- "numeric"
+
+## 只保留目标样本
+common_samples <- intersect(meta$sample, colnames(expr))
+meta <- meta[common_samples, ]
+expr <- expr[, common_samples]
+
+## 去除低表达/低变异基因
+keep <- rowSums(expr > 1) >= round(0.2 * ncol(expr))
+expr <- expr[keep, ]
+
+# Ensembl -> Gene Symbol
+probeMap <- fread(paste(indir, probe_file, sep = ""), data.table = FALSE)
+rownames(expr) <- sub("\\..*$", "", rownames(expr))
+probeMap$id <- sub("\\..*$", "", probeMap$id)
+probeMap <- probeMap[probeMap$id %in% rownames(expr), ]
+expr <- expr[probeMap$id, ]
+rownames(expr) <- probeMap$gene
+expr <- expr[rownames(expr) != "", ]
+expr <- expr[!is.na(rownames(expr)), ]
+
+# 多个 Ensembl 对应同一个 Symbol
+expr <- avereps(expr)
+a = expr[1:6, 1:6]
+
+write.csv(expr, file.path(outdir2, "1exp/PAAD_TCGA_GTEx_expr.csv"))
+```
+
+# 3. 主分析：Tumor vs Normal
+```{r}
+meta$group <- factor(meta$group, levels = c("Normal", "Tumor"))
+design_main <- model.matrix(~ group, data = meta)
+# design_main <- model.matrix(~ source + group, data = meta)
+
+fit_main <- lmFit(expr, design_main)
+fit_main <- eBayes(fit_main)
+
+deg_main <- topTable(
+  fit_main,
+  coef = "groupTumor",
+  number = Inf,
+  adjust.method = "BH")
+
+deg_main <- deg_main %>%
+  rownames_to_column("Gene")
+
+deg_main$change <- "NotSig"
+deg_main$change[deg_main$adj.P.Val < 0.05 & deg_main$logFC > 1] <- "Up"
+deg_main$change[deg_main$adj.P.Val < 0.05 & deg_main$logFC < -1] <- "Down"
+table(deg_main$change)
+
+write.csv(
+  deg_main,
+  file.path(outdir2, "2DEG/01_DEG_main_Tumor_vs_Normal_GTEx_plus_NAT.csv"),
+  row.names = FALSE)
+
+deg_main_sig <- deg_main %>%
+  filter(adj.P.Val < 0.05, abs(logFC) > 1)
+table(deg_main_sig$change)
+
+write.csv(
+  deg_main_sig,
+  file.path(outdir2, "2DEG/01_DEG_main_significant_adjP005_logFC1.csv"),
+  row.names = FALSE)
+
+```
+
+# 4.2 PCA-v1
+```{r}
+## =========================
+## 1. PCA before adjustment
+## =========================
+pca_before <- prcomp(t(expr), scale. = TRUE)
+
+var_before <- round(100 * pca_before$sdev^2 / sum(pca_before$sdev^2), 1)
+
+pca_before_df <- data.frame(
+  sample = rownames(pca_before$x),
+  PC1 = pca_before$x[, 1],
+  PC2 = pca_before$x[, 2],
+  meta[rownames(pca_before$x), ]
+)
+
+## =========================
+## 2. Remove source effect for visualization only
+## =========================
+design_keep_group <- model.matrix(~ group, data = meta)
+
+expr_after <- removeBatchEffect(
+  expr,
+  batch = meta$source,
+  design = design_keep_group
+)
+
+pca_after <- prcomp(t(expr_after), scale. = TRUE)
+
+var_after <- round(100 * pca_after$sdev^2 / sum(pca_after$sdev^2), 1)
+
+pca_after_df <- data.frame(
+  sample = rownames(pca_after$x),
+  PC1 = pca_after$x[, 1],
+  PC2 = pca_after$x[, 2],
+  meta[rownames(pca_after$x), ]
+)
+
+## =========================
+## 3. Plot function
+## =========================
+pca_theme <- theme_bw() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9)
+  )
+
+p1 <- ggplot(pca_before_df, aes(PC1, PC2, color = source)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  pca_theme +
+  labs(
+    title = "A. Before adjustment: colored by source",
+    x = paste0("PC1 (", var_before[1], "%)"),
+    y = paste0("PC2 (", var_before[2], "%)"),
+    color = "Source"
+  )
+
+p2 <- ggplot(pca_before_df, aes(PC1, PC2, color = group)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  pca_theme +
+  labs(
+    title = "B. Before adjustment: colored by group",
+    x = paste0("PC1 (", var_before[1], "%)"),
+    y = paste0("PC2 (", var_before[2], "%)"),
+    color = "Group"
+  )
+
+p3 <- ggplot(pca_after_df, aes(PC1, PC2, color = source)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  pca_theme +
+  labs(
+    title = "C. After source adjustment: colored by source",
+    x = paste0("PC1 (", var_after[1], "%)"),
+    y = paste0("PC2 (", var_after[2], "%)"),
+    color = "Source"
+  )
+
+p4 <- ggplot(pca_after_df, aes(PC1, PC2, color = group)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  pca_theme +
+  labs(
+    title = "D. After source adjustment: colored by group",
+    x = paste0("PC1 (", var_after[1], "%)"),
+    y = paste0("PC2 (", var_after[2], "%)"),
+    color = "Group"
+  )
+
+## =========================
+## 4. Patchwork combine
+## =========================
+p_pca_4panel <- (p1 | p2) / (p3 | p4) +
+  plot_annotation(
+    title = "PCA assessment of TCGA-GTEx source effect",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+    ))
+
+ggsave(
+  filename = file.path(outdir2, "figure/PCA_4panel_source_group_pre_post_adjustment.pdf"),
+  plot = p_pca_4panel,
+  width = 11,
+  height = 9
+)
+```
+# 4.2 PCA-v2
+```{r}
+## PCA before source adjustment
+pca1 <- prcomp(t(expr), scale. = TRUE)
+
+pca1_df <- data.frame(
+  PC1 = pca1$x[, 1],
+  PC2 = pca1$x[, 2],
+  meta
+)
+
+p1 <- ggplot(pca1_df, aes(PC1, PC2, color = subtype, shape = source)) +
+  geom_point(size = 3, alpha = 0.85) +
+  theme_bw() +
+  labs(
+    title = "PCA before source adjustment",
+    color = "Subtype",
+    shape = "Source"
+  )
+
+## PCA after source adjustment, only for visualization
+design_pca <- model.matrix(~ group, data = meta)
+
+expr_source_removed <- removeBatchEffect(
+  expr,
+  batch = meta$source,
+  design = design_pca
+)
+
+pca2 <- prcomp(t(expr_source_removed), scale. = TRUE)
+
+pca2_df <- data.frame(
+  PC1 = pca2$x[, 1],
+  PC2 = pca2$x[, 2],
+  meta
+)
+
+p2 <- ggplot(pca2_df, aes(PC1, PC2, color = subtype, shape = source)) +
+  geom_point(size = 3, alpha = 0.85) +
+  theme_bw() +
+  labs(
+    title = "PCA after source adjustment",
+    color = "Subtype",
+    shape = "Source"
+  )
+
+p_pca_2panel <- p1 + p2
+  plot_annotation(
+    title = "PCA assessment of TCGA-GTEx source effect",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+    )
+  )
+
+p_pca_2panel
+
+ggsave(
+  filename = file.path(outdir2, "figure/PCA_2panel_source_group_pre_post_adjustment.pdf"),
+  plot = p_pca_2panel,
+  width = 9,
+  height = 3)
+```
+# 5. 火山图：主分析
+```{r}
+p_volcano <- ggplot(deg_main, aes(logFC, -log10(adj.P.Val), color = change)) +
+  geom_point(size = 1, alpha = 0.7) +
+  theme_bw() +
+  labs(
+    title = "Main DEG: TCGA PAAD Tumor vs Normal",
+    x = "log2 fold change",
+    y = "-log10 adjusted P value"
+  )
+p_volcano
+
+ggsave(
+  file.path(outdir2, "figure/03_Volcano_main_Tumor_vs_Normal.pdf"),
+  p_volcano, width = 6, height = 5)
+```
+
+# 6. 验证分析：TCGA Tumor vs TCGA NAT
+```{r}
+meta_tcga <- meta %>%
+  filter(source == "TCGA", subtype %in% c("TCGA_Tumor", "TCGA_NAT"))
+
+expr_tcga <- expr[, rownames(meta_tcga)]
+
+meta_tcga$group_tcga <- ifelse(meta_tcga$subtype == "TCGA_Tumor", "Tumor", "NAT")
+meta_tcga$group_tcga <- factor(meta_tcga$group_tcga, levels = c("NAT", "Tumor"))
+
+design_tcga <- model.matrix(~ group_tcga, data = meta_tcga)
+
+fit_tcga <- lmFit(expr_tcga, design_tcga)
+fit_tcga <- eBayes(fit_tcga)
+
+deg_tcga <- topTable(
+  fit_tcga,
+  coef = "group_tcgaTumor",
+  number = Inf,
+  adjust.method = "BH"
+)
+
+deg_tcga <- deg_tcga %>%
+  rownames_to_column("Gene")
+
+deg_tcga$change_tcga <- "NotSig"
+deg_tcga$change_tcga[deg_tcga$adj.P.Val < 0.05 & deg_tcga$logFC > 1] <- "Up"
+deg_tcga$change_tcga[deg_tcga$adj.P.Val < 0.05 & deg_tcga$logFC < -1] <- "Down"
+
+write.csv(
+  deg_tcga,
+  file.path(outdir2, "2DEG/02_DEG_validation_TCGA_Tumor_vs_NAT.csv"),
+  row.names = FALSE)
+
+```
+
+# 7. 候选基因在 TCGA Tumor vs NAT 中方向是否一致
+```{r}
+direction_check <- deg_main_sig %>%
+  dplyr::select(Gene, logFC_main = logFC, adjP_main = adj.P.Val, change_main = change) %>%
+  left_join(
+    deg_tcga %>%
+      dplyr::select(Gene, logFC_tcga = logFC, adjP_tcga = adj.P.Val, change_tcga),
+    by = "Gene") %>%
+  mutate(
+    same_direction = case_when(
+      logFC_main > 0 & logFC_tcga > 0 ~ TRUE,
+      logFC_main < 0 & logFC_tcga < 0 ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    validated_direction = case_when(
+      same_direction == TRUE ~ "Same direction",
+      same_direction == FALSE ~ "Opposite direction",
+      TRUE ~ "NA"
+    )
+  )
+
+table(direction_check$validated_direction)
+
+write.csv(
+  direction_check,
+  file.path(outdir2, "2DEG/03_Main_DEG_direction_validation_in_TCGA_NAT.csv"),
+  row.names = FALSE)
+
+direction_same <- direction_check %>% filter(same_direction == TRUE)
+table(direction_same$change_main)
+write.csv(
+  direction_same,
+  file.path(outdir2, "2DEG/03_Main_DEG_same_direction_in_TCGA_NAT.csv"),
+  row.names = FALSE)
+
+```
+
+# 8. 针对重点基因画表达箱线图
+```{r}
+genes_interest <- c("FLOT1", "LCN2", "LRRC42")
+
+plot_df <- expr[intersect(genes_interest, rownames(expr)), , drop = FALSE] %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("sample") %>%
+  left_join(meta, by = "sample") %>%
+  tidyr::pivot_longer(
+    cols = all_of(intersect(genes_interest, rownames(expr))),
+    names_to = "Gene",
+    values_to = "Expression"
+  )
+
+p_gene <- ggplot(plot_df, aes(subtype, Expression, fill = subtype)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.2, size = 1, alpha = 0.5) +
+  facet_wrap(~ Gene, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "Expression of candidate genes across GTEx Normal, TCGA NAT, and TCGA Tumor",
+    x = "",
+    y = "log2 normalized expression"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_gene
+
+comparisons <- list(
+  c("GTEx_Normal", "TCGA_NAT"),
+  c("GTEx_Normal", "TCGA_Tumor"),
+  c("TCGA_NAT", "TCGA_Tumor")
+)
+
+p_gene <- ggplot(
+  plot_df,
+  aes(x = subtype, y = Expression, fill = subtype)
+) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.6) +
+  geom_jitter(width = 0.18, size = 1.2, alpha = 0.6) +
+
+  facet_wrap(~Gene, scales = "free_y") +
+
+  stat_compare_means(
+    comparisons = comparisons,
+    method = "wilcox.test",
+    label = "p.signif"
+  ) +
+
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Expression of candidate genes",
+    x = "",
+    y = "log2 normalized expression"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+p_gene
+
+ggsave(
+  filename = file.path(outdir2, "figure/important_gene.pdf"),
+  plot = p_gene,
+  width = 11,
+  height = 4)
+```
+
+# 9. 输出 summary
+```{r}
+summary_table <- data.frame(
+  Analysis = c(
+    "Main Tumor vs Normal",
+    "Main significant up",
+    "Main significant down",
+    "Same direction in TCGA Tumor vs NAT"
+  ),
+  Count = c(
+    nrow(deg_main),
+    sum(deg_main$change == "Up"),
+    sum(deg_main$change == "Down"),
+    nrow(direction_same)
+  )
+)
+
+write.csv(
+  summary_table,
+  file.path(outdir2, "2DEG/00_summary_DEG_counts.csv"),
+  row.names = FALSE
+)
+
+print(summary_table)
+```
+# 10. convert rda
+```{r}
+# 对于exo
+load("../../Result/Exp/exo.RData")
+profile <- exp_dat_exo
+metadata <- phen_dat_exo
+save(profile, metadata, file = "../../Result/JiaBo/1exp/exo.RData")
+
+# 对于tis的tpm
+phen_dat_tis <- read.csv(paste0(outdir2, "1exp/PAAD_TCGA_GTEx_metadata.csv"))
+metadata <- data.frame(Compvar = phen_dat_tis$group, SampleID = phen_dat_tis$sample)
+metadata$Compvar <- ifelse(metadata$Compvar == "Tumor", "PAAD", "Healthy")
+rownames(metadata) <- metadata$SampleID
+
+# exp_dat_tis <- read.csv(paste0(outdir2, "1exp/PAAD_TCGA_GTEx_expr.csv"), row.names = 1, check.names = F) # Deseq2 count
+# profile <- exp_dat_tis[, metadata$SampleID]
+
+expr <- fread(paste(indir, "TcgaTargetGtex_rsem_gene_tpm", sep = ""), data.table = FALSE) # tpm
+gene_col <- colnames(expr)[1]
+expr <- expr %>% column_to_rownames(gene_col)
+expr <- as.matrix(expr)
+mode(expr) <- "numeric"
+common_samples <- intersect(metadata$SampleID, colnames(expr))
+expr <- expr[, common_samples]
+# keep <- rowSums(expr > 1) >= round(0.2 * ncol(expr))
+# expr <- expr[keep, ]
+probeMap <- fread(paste(indir, probe_file, sep = ""), data.table = FALSE)
+rownames(expr) <- sub("\\..*$", "", rownames(expr))
+probeMap$id <- sub("\\..*$", "", probeMap$id)
+probeMap <- probeMap[probeMap$id %in% rownames(expr), ]
+expr <- expr[probeMap$id, ]
+rownames(expr) <- probeMap$gene
+expr <- expr[rownames(expr) != "", ]
+expr <- expr[!is.na(rownames(expr)), ]
+expr <- avereps(expr)
+a = expr[1:6, 1:6]
+profile <- expr[, metadata$SampleID]
+
+c("APOB", "HIST2H3C") %in% rownames(profile)
+save(profile, metadata, file = "../../Result/JiaBo/1exp/tis.RData")
+```
+
+

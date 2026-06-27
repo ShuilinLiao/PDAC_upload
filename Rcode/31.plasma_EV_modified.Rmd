@@ -1,0 +1,417 @@
+---
+title: "01.load_data.Rmd"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(tibble)
+library(limma)
+
+library(glmnet)
+library(ggvenn)
+library(patchwork)
+library(ComplexHeatmap)
+library(colorRamp2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichR)
+library(stringr)
+library(pheatmap)
+
+library(enrichplot)
+library(ggpubr)
+library(tidyverse)
+library(impute)
+
+library(gground)
+library(ggprism)
+library(pROC)
+
+# rm(list = ls())
+```
+
+
+# 1 load data
+```{r}
+out_dir <- "../../Result/JiaBo/4MS/"
+
+expr_dat <- read.csv("../../data/P10_P11_46samples_DIA_Report.csv")
+phen_dat1 <- read.csv("../../data/P10_P11_46samples_DIA_Report_phen_data.csv") %>%
+  filter(SubGroup %in% c("HC", "PDAC")) 
+table(phen_dat1$SubGroup)
+phen_dat <- phen_dat1
+source("./proteomics_sensitivity_functions.R")
+
+sel_bats = c("Exosome_Mass4")
+file_label = "batch4"
+fig_plot <- "../../Result/JiaBo/figure/MS/"
+
+phen_dat <- phen_dat %>% 
+  filter(SubGroup %in% c("PDAC", "HC")) %>%
+  filter(Omics %in% sel_bats)
+table(phen_dat$Omics, phen_dat$SubGroup)
+
+all_cols <- c("GeneID", phen_dat$SampleID)
+
+if(file_label == "batch4"){
+  expr_dat_fil <- expr_dat[, all_cols]
+}else{
+ expr_dat_fil <- expr_dat[, ..all_cols] 
+}
+
+```
+# 3 外泌体经典marker热图
+```{r}
+hc_samples   <- phen_dat$SampleID[phen_dat$SubGroup == "HC"]
+pdac_samples <- phen_dat$SampleID[phen_dat$SubGroup == "PDAC"]
+all_samples  <- phen_dat$SampleID
+
+all_genes <- unique(expr_dat_fil$GeneID)
+all_freq_mat <- data.frame(
+  HC   = calc_freq_safe(all_genes, expr_dat_fil, hc_samples),
+  PDAC = calc_freq_safe(all_genes, expr_dat_fil, pdac_samples),
+  ALL  = calc_freq_safe(all_genes, expr_dat_fil, all_samples)
+)
+rownames(all_freq_mat) <- all_genes
+all_freq_mat <- all_freq_mat[rowSums(all_freq_mat != 0, na.rm = TRUE) > 0, ]
+# write.csv(all_freq_mat, paste0(out_dir, file_label, "_all_prots_freq.csv"))
+
+target_genes <- c("TGFBI", "HBB", "LGALS3BP", "FN1", 
+                  "A2M", "ACTB", "CD63", "TSG101",
+                  "VCP", "ITGB1", "ADAM10", "CD9", 
+                  "YWHAG", "LCN2", "HSP90AA1",
+                  "GPC1", "MMP9") # "LCN2", 
+freq_mat <- all_freq_mat[target_genes, ]
+
+pref_plot <- paste0(fig_plot, file_label, "_1exosome_marker_heatmap")
+pdf(paste0(pref_plot, ".pdf"), width = 4, height = 5)
+pheatmap(freq_mat, 
+         cluster_cols = FALSE, 
+         cluster_rows = T, 
+         treeheight_row = 0,
+         display_numbers = TRUE, 
+         number_format = "%.0f", 
+         main = "Detection Frequency (%)",
+         color = colorRampPalette(c("#ffeda0", "#fd8d3c", "#e31a1c"))(100))
+dev.off()
+```
+
+
+# 4 sensitivity analyses
+```{r}
+# --- Prepare matrix ---
+mat_raw <- prepare_proteomics_matrix(expr_dat_fil)
+
+# --- Missingness table ---
+missing_table <- calculate_missingness(mat_raw, phen_dat)
+write.csv(
+  missing_table,
+  file = paste0(out_dir, file_label, "_all_prots_freq.csv"),
+  row.names = FALSE
+)
+
+# --- sensitivity analysis ---
+sen_res <- run_lcn2_sensitivity(
+  mat_raw = mat_raw,
+  phen_dat = phen_dat,
+  target = "LCN2",
+  sample_col = "SampleID",
+  group_col = "SubGroup",
+  control_group = "HC",
+  case_group = "PDAC"
+)
+save(sen_res, file = paste0(out_dir, file_label, "_MS_result.rda"))
+
+mat_fil <- sen_res$filtered_matrix
+mat_log <- sen_res$log_matrix
+
+# --- Save DEP results under different imputation strategies ---
+knn_dep <- sen_res$res_knn %>% mutate(
+    Regulation = case_when(
+      adj.P.Val < 0.05 & logFC > 1 ~ "Up",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Down",
+      TRUE ~ "Not significant"))
+      
+write.csv(knn_dep,
+          paste0(out_dir, file_label, "_DEP_KNN.csv"),
+          row.names = FALSE)
+
+write.csv(sen_res$res_noimp,
+          paste0(out_dir, file_label, "_DEP_NoImputation.csv"),
+          row.names = FALSE)
+
+write.csv(sen_res$res_minprob,
+          paste0(out_dir, file_label, "_DEP_MinProb.csv"),
+          row.names = FALSE)
+
+dep_summary_knn <- count_dep_direction(sen_res$res_knn)
+dep_summary_noimp <- count_dep_direction(sen_res$res_noimp)
+dep_summary_minprob <- count_dep_direction(sen_res$res_minprob)
+
+dep_summary_all <- rbind(
+  cbind(Method = "KNN imputation", dep_summary_knn),
+  cbind(Method = "No imputation", dep_summary_noimp),
+  cbind(Method = "MinProb imputation", dep_summary_minprob)
+)
+
+write.csv(
+  dep_summary_all,
+  paste0(out_dir, file_label, "_DEP_direction_summary.csv"),
+  row.names = FALSE
+)
+
+```
+
+# 5 LCN2/GPC1
+```{r}
+load(paste0(out_dir, file_label, "_MS_result.rda"))
+# --- Power estimation for LCN2 ---
+power_table <- estimate_target_power(sen_res$target_raw_df)
+
+write.csv(
+  power_table,
+  file = paste0(out_dir, file_label, "_LCN2_power_estimation.csv"),
+  row.names = FALSE
+)
+
+# --- sensitivity analysis ---
+lcn2_sen <- sen_res$target_sensitivity
+write.csv(
+  lcn2_sen,
+  file = paste0(out_dir, file_label, "_LCN2_sensitivity_analysis.csv"),
+  row.names = FALSE
+)
+
+# 在各个插补的表达矩阵的情况下绘制柱状图和箱型图
+mat_knn <- sen_res$knn_mat
+mat_noimp <- sen_res$log_matrix
+mat_minprob <- sen_res$minprob_mat
+
+mat_list <- list(
+  KNN = mat_knn,
+  NoImputation = mat_noimp,
+  MinProb = mat_minprob)
+
+stopifnot(all(sapply(mat_list, function(x) "LCN2" %in% rownames(x))))
+
+# Plot LCN2 (or switch gene easily)
+c("LCN2", "FUT3",  "GPC1") %in% rownames(mat_noimp)
+plot_gene_imputation_comparison(
+  gene = "FUT3", # LCN2 GPC1 FUT3
+  phen_dat = phen_dat,
+  mat_list = mat_list,
+  out_prefix = paste0(file_label, "_4_"),
+  fig_plot = fig_plot
+)
+
+```
+
+```{r}
+# ===============================
+# ROC analysis for LCN2 (plasma EVs)
+# ===============================
+
+# extract LCN2 intensity + group label
+roc_df <- sen_res$target_raw_df 
+
+# ensure correct factor order
+roc_df$Group <- factor(roc_df$Group, levels = c("HC", "PDAC"))
+
+# ROC curve
+roc_obj <- roc(
+  response = roc_df$Group,
+  predictor = roc_df$Expression,
+  levels = c("HC", "PDAC"),
+  direction = "<"
+)
+
+# AUC
+auc_val <- auc(roc_obj)
+ci_auc <- ci.auc(roc_obj)
+
+# print results
+print(roc_obj)
+print(auc_val)
+print(ci_auc)
+
+# plot ROC
+pdf(paste0(fig_plot, file_label, "_LCN2_ROC.pdf"), width = 5, height = 5)
+
+plot(
+  roc_obj,
+  col = "#2C7FB8",
+  lwd = 2,
+  main = "ROC of LCN2 in microfluidic-isolated plasma EVs"
+)
+
+legend(
+  "bottomright",
+  legend = paste0(
+    "AUC = ", round(auc_val, 3),
+    "\n95% CI: ",
+    round(ci_auc[1], 3), "-",
+    round(ci_auc[3], 3)
+  ),
+  bty = "n"
+)
+
+dev.off()
+```
+
+
+
+# 6 差异蛋白和富集
+```{r}
+deg_list <- list(
+  KNN = sen_res$res_knn,
+  NoImputation = sen_res$res_noimp,
+  MinProb = sen_res$res_minprob
+)
+
+for (method in names(deg_list)) {
+  # method = "KNN"
+  deg <- deg_list[[method]]
+
+  # volcano
+  plot_volcano(
+    deg,
+    title = paste0("Volcano: ", method),
+    file_path = paste0(fig_plot, file_label, "_volcano_", method, ".pdf"))
+
+  up_genes <- deg$GeneID[deg$change == "UP"]
+  down_genes <- deg$GeneID[deg$change == "DOWN"]
+
+  res_up_go <- run_enrichment(up_genes, "GO")
+  res_up_kegg <- run_enrichment(up_genes, "KEGG")
+
+  res_down_go <- run_enrichment(down_genes, "GO")
+  res_down_kegg <- run_enrichment(down_genes, "KEGG")
+
+  save(res_up_go, res_up_kegg,
+       res_down_go, res_down_kegg,
+       file = paste0(out_dir, file_label, "_enrich_", method, ".rda"))
+}
+```
+
+# 7 挑选通路
+```{r}
+int_cols <- intersect(colnames(res_up_go@result), colnames(res_up_kegg@result)) %>% c("ONTOLOGY")
+up_merg <- rbind(res_up_go@result %>% dplyr::select(all_of(int_cols)), 
+                 res_up_kegg@result %>% mutate(ONTOLOGY = "KEGG") %>% dplyr::select(all_of(int_cols)))
+
+fil_desc <- c("complement activation", "cell-substrate adhesion", "wound healing", "extracellular matrix organization",
+              "vesicle lumen", "microfibril", "blood microparticle", 
+              "Complement and coagulation cascades", "ECM-receptor interaction", "PI3K-Akt signaling pathway")
+# 筛选通路
+use_pathway <- group_by(up_merg, ONTOLOGY) %>%
+  
+    # top_n(5, wt = -p.adjust) %>%
+    # group_by(p.adjust) %>%
+    # top_n(1, wt = Count) %>%
+    # ungroup() %>%
+  
+    filter(Description %in% fil_desc) %>%
+    mutate(ONTOLOGY = factor(ONTOLOGY, levels = rev(c('BP', 'CC', 'KEGG')))) %>%
+    dplyr::arrange(ONTOLOGY, p.adjust) %>%
+    mutate(Description = factor(Description, levels = Description)) %>%
+    tibble::rowid_to_column('index')
+
+use_pathway <- use_pathway %>%
+  mutate(p_log = -log10(p.adjust)) %>%
+  mutate(p_log = ifelse(p_log > 16, 16, p_log))
+
+# 构造左侧标记数据
+width <- 0.5 # 左侧分类标签和基因数量点图的宽度
+xaxis_max <- max(use_pathway$p_log) + 1 # x 轴长度
+rect.data <- group_by(use_pathway, ONTOLOGY) %>%
+    reframe(n = n()) %>%
+    ungroup() %>%
+    mutate(
+        xmin = -3 * width,
+        xmax = -2 * width,
+        ymax = cumsum(n),
+        ymin = lag(ymax, default = 0) + 0.6,
+        ymax = ymax + 0.4)
+
+# 获取 SYMBOL 列表
+convert_top5_with_dots <- function(ids_string) {
+  id_vec <- unlist(strsplit(ids_string, "/"))
+  suppressMessages({
+    df_map <- bitr(id_vec, 
+                   fromType = "ENTREZID", 
+                   toType = "SYMBOL", 
+                   OrgDb = org.Hs.eg.db)})
+  
+  if (nrow(df_map) == 0) return(NA)
+  symbols <- df_map$SYMBOL
+  if (length(symbols) > 5) {
+    res <- paste(paste(symbols[1:5], collapse = "/"), "...", sep = "/")
+  } else {
+    res <- paste(symbols, collapse = "/")
+  }
+  return(res)
+}
+
+use_pathway <- use_pathway %>%
+  rowwise() %>%
+  mutate(geneID2 = convert_top5_with_dots(geneID)) %>%
+  ungroup()
+```
+
+## 富集图--带基因
+```{r}
+pal <- c('#7bc4e2', '#acd372', '#fbb05b', '#ed6ca4')
+pl <- use_pathway %>%
+  ggplot(aes(p_log, y = index, fill = ONTOLOGY)) +
+  geom_round_col(
+    aes(y = Description), width = 0.6, alpha = 0.8) +
+    geom_text(aes(x = 0.05, label = Description),hjust = 0, size = 5) +
+    geom_text(aes(x = 0.1, label = geneID2, colour = ONTOLOGY), 
+              hjust = 0, vjust = 2.5, size = 3.5, fontface = 'italic', 
+              show.legend = FALSE) +
+    # 基因数量
+    geom_point(aes(x = -width, size = Count),shape = 21) +
+    geom_text(aes(x = -width, label = Count)) +
+    scale_size_continuous(name = 'Count', range = c(5, 16)) +
+    # 分类标签
+    geom_round_rect(aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = ONTOLOGY),
+                    data = rect.data, radius = unit(2, 'mm'), inherit.aes = FALSE) +
+    geom_text(aes(x = (xmin + xmax) / 2, y = (ymin + ymax) / 2, label = ONTOLOGY), 
+              data = rect.data, inherit.aes = FALSE) +
+    geom_segment(aes(x = 0, y = 0, xend = xaxis_max, yend = 0), linewidth = 1.5, inherit.aes = FALSE) +
+    labs(y = NULL) +
+    scale_fill_manual(name = 'Category', values = pal) +
+    scale_colour_manual(values = pal) +
+    scale_x_continuous(
+        breaks = seq(0, xaxis_max, 2), 
+        expand = expansion(c(0, 0))) +
+    theme_prism() +
+    theme(
+        axis.text.y = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.title = element_text(),
+        aspect.ratio = 1)
+pl
+pref_plot <- paste0(fig_plot, file_label, "_3DEP_enrich_up_barGene")
+pdf(paste0(pref_plot, ".pdf"), width = 7, height = 6)
+print(pl)
+dev.off()
+```
+
+## 富集图--气泡图
+```{r}
+enrich_Dat <- res_up$GO@result
+pref_plot <- paste0(fig_plot, file_label, "_3DEP_enrich")
+pdf(paste0(pref_plot, ".pdf"), width = 6, height = 5)
+dotplot(res_up$GO , split="ONTOLOGY") + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+```
+
+
+
+

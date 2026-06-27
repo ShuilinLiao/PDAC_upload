@@ -1,0 +1,235 @@
+---
+title: "Machine learning based on LASSO regression model"
+output: html_document
+---
+
+## Introduction
+
+
+Feature selection using LASSO on the DEGs.
+
+
+```{r setup, include=TRUE, warning = F, message = F}
+knitr::opts_chunk$set(warning = F, message = F)
+library(tidyverse)
+library(Biobase)
+library(glmnet)
+library(caret)
+library(ROCR)
+library(pROC)
+
+library(sysfonts)
+library(showtextdb)
+library(showtext)
+#激活显示中文的包
+showtext_auto()
+
+rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 10000 * 1024^2)
+```
+ 
+```{r}
+grp_names <- c("Healthy", "PAAD")
+grp_colors <- c("#1F78B4", "#EE2B2B")
+
+## Importing data
+da_res <- read.csv("../../Result/DE/DEG_merge_limma.csv")
+load("../../Result/Exp/exo.RData")
+load("../../Result/JiaBo/2DEG/overlap_genes.rda")
+source("./utilities.R")
+source("../functions.R")
+item = "exo" 
+profile <- exp_dat_exo
+metadata <- phen_dat_exo  
+
+## Curation
+profile_DEG <- profile[pmatch(overlap_genes, rownames(profile)), ] %>%
+  t() %>%
+  as.data.frame()
+
+pref <- paste0("../../Result/JiaBo/3ML/", item)
+fig_plot <- "../../Result/JiaBo/figure/ML1/"
+pref_plot <- paste0(fig_plot, item, "_LASSO_")
+```
+
+
+## LASSO
+
++ split data
+```{r}
+set.seed(123)
+
+trainIndex <- caret::createDataPartition(
+          metadata$Compvar, 
+          p = 0.8, 
+          list = FALSE, 
+          times = 1)
+
+y_train <- metadata[trainIndex, ]
+X_train <- profile_DEG[rownames(profile_DEG) %in% y_train$SampleID, ] %>%
+  as.matrix()
+
+y_test <- metadata[-trainIndex, ]
+X_test <- profile_DEG[!rownames(profile_DEG) %in% y_train$SampleID, ] %>%
+  as.matrix()
+```
+
+
+
++ Model: 
+
+  - LASSO: alpha = 1
+  
+  - ridge: alpha = 0
+  
+```{r}
+set.seed(123)
+
+cv.fit <- cv.glmnet(
+  x = X_train, 
+  y = y_train$Compvar, 
+  family = "binomial",
+  keep = TRUE,
+  type.measure = "class", # deviance, mae, class, auc, mse
+  nfolds = 10,
+  alpha = 1,
+  nlambda = 100)
+cv.fit$lambda.min
+
+plot(cv.fit)
+
+pdf(paste0(pref_plot, "glmnet.pdf"), width = 5, height = 4)
+plot(cv.fit)
+dev.off()
+f2g(paste0(pref_plot, "glmnet.pdf"), paste0(pref_plot, "glmnet.png"))
+```
+
++ Prediction
+
+```{r}
+predict(cv.fit, X_test, s = "lambda.min", type = "class") %>%
+  as.data.frame() %>%
+  setNames("Predicted") %>%
+  cbind(data.frame(Actual = y_test$Compvar)) %>%
+  head()
+```
+
++ Confusion matrices for classification
+```{r}
+cnf <- confusion.glmnet(
+  object = cv.fit, 
+  newx = X_test, 
+  newy = y_test$Compvar, 
+  s = "lambda.min")
+```
+
+## Final model
+
++ selected features
+```{r}
+optimal_feature <- coef(cv.fit, s = "lambda.min") %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  setNames("Coef") %>%
+  dplyr::filter(Coef != 0) %>%
+  tibble::rownames_to_column("FeatureID") %>%
+  dplyr::slice(-1)  %>%
+  arrange(Coef)
+optimal_feature$FeatureID <- factor(optimal_feature$FeatureID, levels = optimal_feature$FeatureID)
+
+main_theme <- 
+  theme(
+    panel.background = element_blank(),
+    panel.grid = element_blank(),
+    axis.line.x = element_line(linewidth = 0.5, color = "black"),
+    axis.line.y = element_line(linewidth = 0.5, color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.title = element_text(size = 11, color = "black", face = "bold"),    
+    axis.text = element_text(color = "black", size = 10),
+    legend.position = "right",
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    legend.text = element_text(size = 12),
+    aspect.ratio = 2)
+
+optimal_feature_pl <- optimal_feature  %>%
+  ggplot(aes(x = FeatureID, y = Coef))+
+    geom_bar(stat = "identity", fill = "white", color = "blue") +
+    labs(x = "", y = "Coefficient") +
+    coord_flip() +
+    main_theme
+
+optimal_feature_pl
+
+write.csv(optimal_feature, paste0(pref, "_LASSO_feature.csv"), row.names = F)
+ggsave(paste0(pref_plot, "optimal_feature.pdf"), optimal_feature_pl, width = 5, height = 7, dpi = 600)
+```
+
++ Model
+```{r}
+selected_columns <- optimal_feature$FeatureID
+
+trainData_select <- X_train[, selected_columns] %>% data.frame(Group = y_train$Compvar, .)
+trainData_select$Group <- as.factor(trainData_select$Group)
+X_train_select <- trainData_select[, -1]
+y_train_select <- trainData_select[, 1]
+
+testData_select <- X_test[, selected_columns] %>% data.frame(Group = y_test$Compvar, .)
+testData_select$Group <- as.factor(testData_select$Group)
+X_test_select <- testData_select[, -1]
+y_test_select <- testData_select[, 1]
+
+lr_model <- glm(Group ~ ., data = trainData_select, family = "binomial")
+summary(lr_model)
+
+pred_prob <- predict(lr_model, X_test_select, type="response")
+roc_obj <- pROC::roc(y_test_select, pred_prob)
+roc_data <- coords(roc_obj) %>%
+  dplyr::filter(!threshold %in% c(-Inf, Inf))
+
+youden_index <- max(roc_data$sensitivity + roc_data$specificity - 1)
+
+roc_df <- data.frame(
+  FPR = 1 - roc_data$sensitivity,
+  TPR = roc_data$specificity
+)
+```
+
+
++ Confusion matrix
+
+```{r}
+group_names <- grp_names
+pred_raw <- ifelse(pred_prob >= youden_index,"PAAD","Healthy")
+print(caret::confusionMatrix(as.factor(pred_raw), factor(y_test_select)))
+```
+
++ ROC
+```{r}
+AUROC_res <- AUROC(
+    DataTest = testData_select, 
+    PredProb = data.frame(pred_prob = pred_prob), 
+    label = group_names[1], 
+    DataProf = nrow(optimal_feature))
+AUROC_res$roc_pl
+# save(AUROC_res, file = paste0(pref, "_LASSO_AUROC.RData"))
+ggsave(paste0(pref_plot, "ROC.pdf"), AUROC_res$roc_pl, width = 5, height = 4, dpi = 600)
+```
+
+
+## Final Profile
+```{r}
+profile_LASSO <- profile[pmatch(optimal_feature$FeatureID, rownames(profile)), ]
+write.table(profile_LASSO, paste0(pref, "_LASSO_profile.csv"), row.names = T, sep = "\t", quote = F)
+```
+
+## Session info
+```{r}
+devtools::session_info()
+```
+
+
+## Reference 
+
++ [An Introduction to glmnet](https://glmnet.stanford.edu/articles/glmnet.html)

@@ -1,0 +1,145 @@
+---
+title: "07.22markers_single_AUC_barplot_TCGA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(Biobase)
+library(glmnet)
+library(caret)
+library(ROCR)
+
+library(pROC)
+library(ggpubr)
+library(rstatix)
+library(patchwork)
+library(ggpubr)
+library(ggdist)
+library(gghalves)
+library(tidyverse)
+library(forestplot)
+
+rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 10000 * 1024^2)
+```
+
+# load data
+```{r}
+item = "exo" # exo / tis
+grp_names <- c("Healthy", "PAAD")
+grp_colors <- c("#1F78B4", "#EE2B2B")
+
+source("../functions.R")
+source("./single_marker_AUC_barplot.R")
+source("./utilities.R")
+fig_plot <-"../../Result/JiaBo/figure/"
+common_feat_exo <- read.csv("../../Result/JiaBo/3ML/common_feat.csv")$gene
+tis_deg <- read.csv("../../Result/JiaBo/2DEG/03_Main_DEG_same_direction_in_TCGA_NAT.csv") %>% Define_Change(., "adjP_main", "logFC_main")
+common_feat_up <- filter(tis_deg, change == "Up")$Gene %>% intersect(common_feat_exo)
+common_feat_dw <- filter(tis_deg, change == "Down")$Gene %>% intersect(common_feat_exo)
+
+if(item == "exo"){
+  load("../../Result/JiaBo/1exp/exo.RData")
+  group_colors = c("#4393c3", "#b2abd2")
+}else{
+  load("../../Result/JiaBo/1exp/tis.RData")
+  group_colors = c("#2166ac", "#542788")
+}
+metadata <- metadata %>% dplyr::rename(Group = Compvar)
+
+profile_DEG <- profile[common_feat_exo, ] %>%
+  t() %>%
+  as.data.frame()
+
+MergeData1 <- metadata %>%
+  dplyr::select(SampleID, Group) %>%
+  dplyr::inner_join(profile_DEG %>%
+                      tibble::rownames_to_column("SampleID"),
+                    by = "SampleID") %>%
+  tibble::column_to_rownames("SampleID") %>%
+  dplyr::mutate(Group = factor(Group))
+```
+
+# single marker AUC
+```{r}
+dat <- GetDat(MergeData = MergeData1, cpar = c("Healthy", "PAAD"), select_genes = common_feat_up)
+auc_dat_up = SingleGeneROC(MergeData = dat, grps = c("Healthy", "PAAD"))
+write.csv(auc_dat_up, paste0(fig_plot, item, "_single_AUC.csv"))
+
+pref_plot <- paste0(fig_plot, item, "_single_AUC")
+pdf(paste0(pref_plot, ".pdf"), width = 6, height = 12)
+forestplot(auc_dat_up, 
+           mean = auc_dat_up$AUC, 
+           lower = auc_dat_up$lower, 
+           upper = auc_dat_up$upper, 
+           title = "AUC Comparison with 95% CI",
+           xlab = "AUC Value",
+           boxsize = 0.2,  
+           lineheight = unit(1.2, "cm"),
+           graph.pos = 2,  
+           # is.summary = c(TRUE, rep(FALSE, nrow(data) - 1)),  # 标记总结行
+           col = fpColors(box = "#4575b4", line = "#4575b4", summary = "red"),
+           lwd.ci = 2,  
+           lwd.summary = 2 )
+dev.off()
+```
+
+# Boxplot
+```{r}
+genes = c("FLOT1",  "LCN2", "LRRC42")
+cpars = c("Healthy", "PAAD")
+tit = paste0("PAAD_vs_Healthy_3genes_")
+dat <- GetDat(MergeData = MergeData1, cpar = cpars, select_genes = genes)
+print(table(dat$Group))
+MergeData_long <- tidyr::gather(dat, Gene, value, -Group)
+MergeData_long$Group <- factor(MergeData_long$Group, levels = cpars)
+pl <- get_raincloud(dat_wide = dat,
+                    dat = MergeData_long,
+                    group_names = cpars,
+                    group_colors = group_colors)
+pl
+pref_plot <- paste0(fig_plot, tit, item, "_single_boxplot")
+pdf(paste0(pref_plot, ".pdf"), width = 8, height = 3)
+pl
+dev.off()
+```
+# correlation
+```{r}
+sel_genes <- c("LCN2", "FUT3", "FUT2", "MUC1", "MUC5AC") 
+sel_genes %in% rownames(profile)
+
+profile_DEG <- profile[sel_genes, ] %>%
+  t() %>%
+  as.data.frame()
+
+res_dat <- metadata %>%
+  dplyr::select(SampleID, Group) %>%
+  dplyr::inner_join(profile_DEG %>%
+                      tibble::rownames_to_column("SampleID"),
+                    by = "SampleID") %>%
+  tibble::column_to_rownames("SampleID") %>%
+  dplyr::mutate(Group = factor(Group)) %>%
+  GetDat(MergeData = ., cpar = c("Healthy", "PAAD"), select_genes = sel_genes)
+
+get_cor <- function(df, g1, g2) {
+  tmp <- df %>% dplyr::select(all_of(c(g1, g2))) %>% na.omit()
+  ct <- cor.test(tmp[[1]], tmp[[2]], method = "spearman")
+  data.frame(
+    Gene1 = g1,
+    Gene2 = g2,
+    N = nrow(tmp),
+    rho = as.numeric(ct$estimate),
+    p.value = ct$p.value)}
+
+cor_all <- get_cor(res_dat, "LCN2", "FUT3") %>% mutate(Group = "ALL")
+cor_hc <- res_dat %>% filter(Group == "Healthy") %>%
+  get_cor("LCN2", "FUT3") %>% mutate(Group = "Healthy")
+cor_pdac <- res_dat %>% filter(Group == "PAAD") %>% 
+  get_cor("LCN2", "FUT3") %>% mutate(Group = "PDAC")
+
+cor_table <- bind_rows(cor_all, cor_pdac, cor_hc)
+```
+

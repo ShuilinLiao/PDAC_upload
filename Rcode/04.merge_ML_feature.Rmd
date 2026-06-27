@@ -1,0 +1,107 @@
+---
+title: "03.merge_ML_feature.Rmd"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(data.table)
+library(tibble)
+library(ggplot2)
+library(tidyverse)
+library(ggvenn)
+library(UpSetR)
+
+rm(list = ls())
+
+grp_names <- c("Healthy", "PAAD")
+grp_colors <- c("#8AC786", "#B897CA")
+grp_shapes <- c(15, 16)
+source("../functions.R")
+fig_plot <- "../../Result/JiaBo/figure/"
+```
+
+```{r}
+exo_lasso <- read.csv("../../Result/JiaBo/3ML/exo_LASSO_feature.csv")
+exo_rf <- read.csv("../../Result/JiaBo/3ML/exo_RF_feature.csv")
+exo_svm <- read.csv("../../Result/JiaBo/3ML/exo_SVM_feature.csv")
+
+common_feat_exo <- Reduce(intersect, list(exo_lasso$FeatureID, exo_rf$FeatureID, exo_svm$FeatureID))
+print(common_feat_exo)
+common_feat_df <- data.frame(gene = common_feat_exo, site = "exo")
+write.csv(common_feat_df, "../../Result/JiaBo/3ML/common_feat.csv")
+```
+
+```{r}
+feature_list <- list(
+  LASSO_LR = exo_lasso$FeatureID,
+  Boruta_RF = exo_rf$FeatureID,
+  RFE_SVM = exo_svm$FeatureID
+)
+
+over_LASSO_RF <- intersect(exo_lasso$FeatureID, exo_rf$FeatureID)
+over_SVM_RF <- intersect(exo_svm$FeatureID, exo_rf$FeatureID)
+over_LASSO_SVM <- intersect(exo_lasso$FeatureID, exo_svm$FeatureID)
+
+df_uniq_gene <- data.frame(gene = unique(unlist(feature_list)))
+df_group_gene <- lapply(feature_list, function(x){
+  data.frame(gene = x)
+}) %>% 
+  dplyr::bind_rows(.id = "ML")
+
+df_int_gene <- lapply(df_uniq_gene$gene, function(x){
+  intersection <- df_group_gene %>% 
+    dplyr::filter(gene == x) %>% 
+    dplyr::arrange(ML) %>% 
+    dplyr::pull("ML") %>% 
+    paste0(collapse = "|")
+  
+  # build the dataframe
+  data.frame(gene = x, int = intersection)
+}) %>% dplyr::bind_rows()
+
+```
+
+```{r}
+upset_pl <- UpSetR::upset(
+  data = UpSetR::fromList(feature_list),
+  nsets = 3, 
+  sets = c("LASSO_LR", "Boruta_RF", "RFE_SVM"),
+  order.by = "freq",
+  main.bar.color = c("#878787", "#d6604d", "#878787", "#878787", "#878787", "#878787", "#878787"),
+  matrix.color = "#878787",
+  mainbar.y.label = "NO. of features",
+  sets.x.label = "NO. of features per method",
+  sets.bar.color = c("#caeefb", "#ebc1d9", "#abd19e"))
+
+upset_pl
+
+pref_plot <- paste0(fig_plot)
+pdf(paste0(pref_plot, "merge_ML_fitures_bar.pdf"), width = 7, height = 5, onefile = FALSE)
+upset_pl
+dev.off()
+f2g(paste0(pref_plot, "merge_ML_fitures_bar.pdf"), paste0(pref_plot, "merge_ML_fitures_bar.png"))
+```
+
+```{r}
+over_gene_three <- df_int_gene %>%
+  dplyr::filter(int %in% c("Boruta_RF|LASSO_LR|RFE_SVM")) 
+
+venn_pl <- ggvenn(
+  data = feature_list, 
+  fill_color = c("#abd19e", "#ebc1d9", "#caeefb"),
+  stroke_size = 0.5, 
+  set_name_size = 4,
+  show_percentage = FALSE) + 
+  annotate("text", x = 0, y = 0.01, color = "blue", size = 3,
+           label = paste(over_gene_three$gene, collapse = "\n")) +
+  theme(text = element_text(family = "serif"))
+
+venn_pl
+
+pdf(paste0(fig_plot, "merge_ML_fitures_venn.pdf"), width = 7, height = 5, onefile = FALSE)
+venn_pl
+dev.off()
+f2g(paste0(fig_plot, "merge_ML_fitures_venn.pdf"), paste0(pref_plot, "merge_ML_fitures_venn.png"))
+```

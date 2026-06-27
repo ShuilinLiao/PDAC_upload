@@ -1,0 +1,446 @@
+---
+title: "Machine learning based on Random forest"
+output: html_document
+---
+
+## Introduction
+
+
+Feature selection using Random forest with Boruta on the DEGs.
+
+
+```{r setup, include=TRUE, warning = F, message = F}
+knitr::opts_chunk$set(warning = F, message = F)
+library(tidyverse)
+library(Biobase)
+library(randomForest)
+library(ggplot2)
+library(data.table)
+library(caret)
+library(mlbench)
+library(Boruta)
+library(pROC)
+
+library(sysfonts)
+library(showtextdb)
+library(showtext)
+#激活显示中文的包
+showtext_auto()
+
+rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 10000 * 1024^2)
+
+grp_names <- c("Healthy", "PAAD")
+grp_colors <- c("#1F78B4", "#EE2B2B")
+fig_plot <- "../../Result/JiaBo/figure/"
+```
+
+
+## Importing data 
+```{r}
+load("../../Result/Exp/exo.RData")
+load("../../Result/JiaBo/2DEG/overlap_genes.rda")
+source("./utilities.R")
+source("../functions.R")
+
+item = "exo" 
+profile <- exp_dat_exo
+metadata <- phen_dat_exo  
+metadata <- metadata %>% dplyr::rename(Group = Compvar)
+pref <- paste0("../../Result/JiaBo/3ML/", item)
+fig_plot <- "../../Result/JiaBo/figure/ML1/"
+pref_plot <- paste0(fig_plot, item, "_RF_")
+
+profile_DEG <- profile[pmatch(overlap_genes, rownames(profile)), ] %>%
+  t() %>%
+  as.data.frame()
+```
+
++ Remove redundant variables
+```{r}
+feature_cor <- Hmisc::rcorr(as.matrix(profile_DEG), type = "spearman")
+index_cor <- caret::findCorrelation(feature_cor$r, cutoff = 0.75, verbose = TRUE)
+feature_remain <- feature_cor$r[-index_cor, -index_cor]
+profile_remain <- profile_DEG %>% 
+  dplyr::select(all_of(rownames(feature_remain))) 
+
+print(dim(profile_remain))
+
+write.table(profile_remain, paste0(pref, "_RF_RM_profile.tsv"),
+            row.names = T, sep = "\t", quote = F)
+```
+
++ MergeData 
+
+```{r}
+MergeData <- metadata %>%
+  dplyr::select(SampleID, Group) %>%
+  dplyr::inner_join(profile_remain %>%
+                      tibble::rownames_to_column("SampleID"),
+                    by = "SampleID") %>%
+  tibble::column_to_rownames("SampleID") %>%
+  dplyr::mutate(Group = factor(Group))
+
+```
+
+## Random Forest
+
++ split data
+```{r}
+set.seed(123)
+trainIndex <- caret::createDataPartition(
+          MergeData$Group, 
+          p = 0.8, 
+          list = FALSE, 
+          times = 1)
+
+trainData <- MergeData[trainIndex, ]
+X_train <- trainData[, -1]
+y_train <- trainData[, 1]
+
+testData <- MergeData[-trainIndex, ]
+X_test <- testData[, -1]
+y_test <- testData[, 1]
+```
+
+
++ Base Model
+```{r}
+set.seed(123)
+base.fit <- randomForest(
+  Group ~ .,
+  data = trainData,
+  importance = TRUE)
+
+base.fit
+```
+
++ Important score
+```{r}
+imp_biomarker <- tibble::as_tibble(
+    round(importance(base.fit), 2),
+    rownames = "FeatureID") %>% 
+  dplyr::arrange(desc(MeanDecreaseAccuracy))
+
+# DT::datatable(imp_biomarker)
+```
+
+## Boruta
++ feature selection: Boruta Algorithm 
+
+1. First, it duplicates the dataset, and shuffle the values in each column.
+
+2. Then, the algorithm checks for each of your real features if they have higher importance.
+
+3. At every iteration, the algorithm compares the Z-scores of the shuffled copies of the features and the original features to see if the latter performed better than the former (a Z-score is the number of standard deviations from the mean a data point is, for more info click here.).
+
+4. If a feature hasn't been recorded as a hit in say 15 iterations, you reject it and also remove it from the original matrix.
+
+
+```{r}
+set.seed(123)
+fs_Boruta <- Boruta::Boruta(
+  x = X_train, 
+  y = y_train, 
+  doTrace = 2)
+print(fs_Boruta)
+
+boruta.bank <- Boruta::TentativeRoughFix(fs_Boruta)
+print(boruta.bank)
+
+bank_df <- Boruta::attStats(boruta.bank)
+
+plot(boruta.bank, xlab = "", xaxt = "n")
+lz <- lapply(1:ncol(boruta.bank$ImpHistory), function(i) {
+    boruta.bank$ImpHistory[is.finite(boruta.bank$ImpHistory[, i]), i]
+})
+names(lz) <- colnames(boruta.bank$ImpHistory)
+Labels <- sort(sapply(lz, median))
+axis(side = 1, las = 2, labels = names(Labels),
+at = 1:ncol(boruta.bank$ImpHistory), cex.axis = 0.7)
+
+# save(X_train, y_train, X_test, y_test, 
+#      fs_Boruta, boruta.bank, bank_df,
+#      file = paste0(pref, "_RF_Boruta.RData"))
+
+# pdf(paste0(pref_plot, "Fig5_D.pdf"), width = 7, height = 4)
+  plot(boruta.bank, xlab = "", xaxt = "n")
+  lz <- lapply(1:ncol(boruta.bank$ImpHistory), function(i) {
+    boruta.bank$ImpHistory[is.finite(boruta.bank$ImpHistory[, i]), i]
+  })
+  names(lz) <- colnames(boruta.bank$ImpHistory)
+  Labels <- sort(sapply(lz, median))
+  axis(side = 1, las = 2, labels = names(Labels),
+  at = 1:ncol(boruta.bank$ImpHistory), cex.axis = 0.7)
+# dev.off()
+```
+
+
++ Selected features by Boruta
+```{r}
+feature_Boruta <- bank_df %>%
+  dplyr::filter(decision %in% c("Tentative", "Confirmed"))
+
+trainData_select <- trainData %>%
+  dplyr::select(all_of(c("Group", rownames(feature_Boruta))))
+X_train_select <- trainData_select[, -1]
+y_train_select <- trainData_select[, 1]
+
+testData_select <- testData %>%
+  dplyr::select(all_of(c("Group", rownames(feature_Boruta))))
+X_test_select <- testData_select[, -1]
+y_test_select <- testData_select[, 1]
+```
+
+
++ Tune parameters to choose the Optimal features:
+
+  - mtry
+  
+  - ntree
+  
+```{r}
+set.seed(123)
+
+# N-repeat K-fold cross-validation
+myControl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  search = "random",
+  classProbs = TRUE,
+  verboseIter = TRUE,
+  allowParallel = TRUE)
+
+# customRF
+# https://machinelearningmastery.com/tune-machine-learning-algorithms-in-r/
+customRF <- list(type = "Classification",
+                 library = "randomForest",
+                 loop = NULL)
+
+customRF$parameters <- data.frame(
+  parameter = c("mtry", "ntree"),
+  class = rep("numeric", 2),
+  label = c("mtry", "ntree"))
+
+customRF$grid <- function(x, y, len = NULL, search = "grid") {}
+customRF$fit <- function(x, y, wts, param, lev, last, weights, classProbs, ...) {
+  randomForest(x, y, mtry = param$mtry, ntree=param$ntree, ...)
+}
+
+customRF$predict <- function(modelFit, newdata, preProc = NULL, submodels = NULL) {
+  predict(modelFit, newdata)
+}
+
+customRF$prob <- function(modelFit, newdata, preProc = NULL, submodels = NULL) {
+  predict(modelFit, newdata, type = "prob")
+}
+
+customRF$sort <- function(x) {x[order(x[, 1]), ]}
+customRF$levels <- function(x) {x$classes}
+
+# tuning parameters
+tuneGrid <- expand.grid(
+  .mtry = c(2:15), # sqrt(ncol(X_train))
+  .ntree = seq(500, 2000, 500))
+
+
+# Register parallel cores
+doParallel::registerDoParallel(4)
+
+# train model
+set.seed(123)
+tune_fit <- train(
+  Group ~.,
+  data = trainData_select,
+  method = customRF, #"rf",
+  trControl = myControl,
+  tuneGrid = tuneGrid,
+  metric = "Accuracy",
+  verbose = FALSE) 
+
+## Plot model accuracy vs different values of Cost
+print(plot(tune_fit))
+
+## Print the best tuning parameter that maximizes model accuracy
+optimalVar <- data.frame(tune_fit$results[which.max(tune_fit$results[, 3]), ])
+print(optimalVar)
+
+error.cv <- c()
+for (i in 1:5) {
+  
+  print(i)
+  set.seed(i)
+  
+  fit <- rfcv(trainx = X_train_select, 
+              trainy = y_train_select, 
+              cv.fold = 5, 
+              # scale = "log", 
+              step = 0.9,
+              ntree = optimalVar$ntree)
+  
+  error.cv <- cbind(error.cv, fit$error.cv)
+}
+
+n.var <- as.numeric(rownames(error.cv))
+colnames(error.cv) <- paste("error", 1:5, sep = ".")
+err.mean <- apply(error.cv, 1, mean)
+err.df <- data.frame(num = n.var, 
+                     err.mean = err.mean,
+                     error.cv)
+
+# save(tune_fit, file = paste0(pref, "_RF_tuneFit.RData"))
+# save(error.cv, file = paste0(pref, "_RF_CVerr.RData"))
+```
+
+
++ Visualization of Optimal features
+```{r, fig.width=6, fig.height=4}
+optimal <- err.df$num[which(err.df$err.mean == min(err.df$err.mean))]
+print(optimal) ## choose a value
+main_theme <- 
+  theme(
+    panel.background = element_blank(),
+    panel.grid = element_blank(),
+    axis.line.x = element_line(linewidth = 0.5, color = "black"),
+    axis.line.y = element_line(linewidth = 0.5, color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.title = element_text(size = 11, color = "black", face = "bold"),    
+    axis.text = element_text(color = "black", size = 10),
+    legend.position = "right",
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    legend.text = element_text(size = 12),
+    text = element_text(family = "serif"))
+
+pl <- 
+  ggplot(data = err.df, aes(x = err.df$num)) + 
+    geom_line(aes(y = err.df$error.1), color = "grey", linewidth = 0.5) + 
+    geom_line(aes(y = err.df$error.2), color = "grey", linewidth = 0.5) +
+    geom_line(aes(y = err.df$error.3), color = "grey", linewidth = 0.5) +
+    geom_line(aes(y = err.df$error.4), color = "grey", linewidth = 0.5) +
+    geom_line(aes(y = err.df$error.5), color = "grey", linewidth = 0.5) +
+    geom_line(aes(y = err.df$err.mean), color = "black", linewidth = 0.5) + 
+    geom_vline(xintercept = optimal, color = "red", lwd = 0.36, linetype = 2) + 
+    coord_trans(x = "log2") +
+    scale_x_continuous(breaks = c(1, 5, 10, 20, 30)) +
+    labs(x = "Number of Features ", y = "Cross-validation error rate") + 
+    annotate("text", 
+             x = optimal - 6, 
+             y = max(err.df$err.mean), 
+             label = paste("Optimal = ", optimal, sep = ""),
+             color = "red") +
+    main_theme
+
+pl
+ggsave(paste0(pref_plot, "optimal_feature_number.pdf"), pl, width = 7, height = 4, dpi = 600)
+```
+
+
++ Optimal important score
+```{r, fig.width=6, fig.height=7}
+optimal <- 49
+
+optimal_feature_pl <- imp_biomarker %>%
+  dplyr::filter(FeatureID %in% rownames(feature_Boruta)) %>%
+  dplyr::slice(1:optimal) %>%
+  dplyr::select(FeatureID, MeanDecreaseAccuracy) %>%
+  dplyr::arrange(MeanDecreaseAccuracy) %>%
+  dplyr::mutate(FeatureID = forcats::fct_inorder(FeatureID)) %>%
+  ggplot(aes(x = FeatureID, y = MeanDecreaseAccuracy))+
+  geom_bar(stat = "identity", fill = "white", color = "blue") +
+  labs(x = "", y = "Mean decrease accuracy") +
+  theme(aspect.ratio = 2) +
+    coord_flip() +
+    main_theme
+
+optimal_feature_pl
+
+ggsave(paste0(pref_plot, "optimal_feature.pdf"), optimal_feature_pl, width = 5, height = 7, dpi = 600)
+```
+
+
+
+## Final model of selected features
+
++ building model
+```{r}
+selected_biomarker <- imp_biomarker %>%
+  dplyr::filter(FeatureID %in% rownames(feature_Boruta)) %>%
+  dplyr::slice(1:optimal)  
+
+selected_columns <- c("Group", selected_biomarker$FeatureID)
+
+trainData_optimal <- trainData_select %>%
+  dplyr::select(all_of(selected_columns))
+
+testData_optimal <- testData_select %>%
+  dplyr::select(all_of(selected_columns))
+
+set.seed(123)
+rf_fit_optimal <- randomForest(
+  Group ~ ., 
+  data = trainData_optimal, 
+  importance = TRUE, 
+  proximity = TRUE,
+  ntree = optimalVar$ntree)
+
+rf_fit_optimal
+```
+
+
++ Confusion matrix
+
+```{r}
+group_names <- grp_names
+pred_raw <- predict(rf_fit_optimal, newdata = testData_optimal, type = "response")
+print(caret::confusionMatrix(pred_raw, testData_optimal$Group))
+pred_prob <- predict(rf_fit_optimal, newdata = testData_optimal, type = "prob")  
+```
+
+
++ ROC
+
+```{r}
+AUROC_res <- AUROC(
+    DataTest = testData_select, 
+    PredProb = pred_prob, 
+    label = group_names[1], 
+    DataProf = optimal)
+AUROC_res$roc_pl
+ggsave(paste0(pref_plot, "ROC.pdf"), AUROC_res$roc_pl, width = 5, height = 4, dpi = 600)
+save(AUROC_res, file = paste0(pref, "_RF_AUROC.RData"))
+```
+
+
+## Final profile
+```{r}
+optimal_feature <- imp_biomarker %>%
+  dplyr::filter(FeatureID %in% rownames(feature_Boruta)) %>%
+  dplyr::slice(1:optimal) %>%
+  dplyr::select(FeatureID, MeanDecreaseAccuracy) %>%
+  dplyr::arrange(MeanDecreaseAccuracy) %>%
+  dplyr::mutate(FeatureID = forcats::fct_inorder(FeatureID))
+
+profile_RF <- profile[pmatch(optimal_feature$FeatureID,
+                              rownames(profile)), ]
+
+write.csv(optimal_feature, paste0(pref, "_RF_feature.csv"), row.names = F)
+write.table(profile_RF, paste0(pref, "_RF_profile.tsv"), row.names = T, sep = "\t", quote = F)
+```
+
+## Session info
+```{r}
+devtools::session_info()
+```
+
+
+## Reference 
+
++ [Feature Selection with the Caret R Package](https://machinelearningmastery.com/feature-selection-with-the-caret-r-package/)
+
++ [Feature selection in r](https://jtr13.github.io/cc21fall2/feature-selection-in-r.html)
+
++ [Feature Selection in R with the Boruta R Package](https://www.datacamp.com/tutorial/feature-selection-R-boruta)
+

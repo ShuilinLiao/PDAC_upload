@@ -1,0 +1,469 @@
+---
+title: "Machine learning based on Support Vector Machine"
+output: html_document
+---
+
+## Introduction
+
+
+Feature selection using Support Vector Machine with Recursive Feature Elimination (SVM_RFE) on the DEGs.
+
+
+```{r setup, include=TRUE, warning = F, message = F}
+knitr::opts_chunk$set(warning = F, message = F)
+library(tidyverse)
+library(Biobase)
+library(ggplot2)
+library(data.table)
+library(caret)
+library(e1071)
+library(mlbench)
+library(pROC)
+
+library(sysfonts)
+library(showtextdb)
+library(showtext)
+#激活显示中文的包
+showtext_auto()
+
+# rm(list = ls())
+options(stringsAsFactors = F)
+options(future.globals.maxSize = 10000 * 1024^2)
+```
+
+
+# Importing data 
+```{r}
+grp_names <- c("Healthy", "PAAD")
+grp_colors <- c("#1F78B4", "#EE2B2B")
+
+load("../../Result/Exp/exo.RData")
+load("../../Result/JiaBo/2DEG/overlap_genes.rda")
+source("./utilities.R")
+source("../functions.R")
+item = "exo" 
+profile <- exp_dat_exo
+metadata <- phen_dat_exo  
+metadata <- metadata %>% dplyr::rename(Group = Compvar) 
+pref <- paste0("../../Result/JiaBo/3ML/", item)
+fig_plot <- "../../Result/JiaBo/figure/ML1/"
+pref_plot <- paste0(fig_plot, item, "_SVM_")
+
+profile_DEG <- profile[pmatch(overlap_genes, rownames(profile)), ] %>%
+  t() %>%
+  as.data.frame()
+```
+
+# prepocess
++ Remove redundant variables
+
+```{r}
+feature_cor <- Hmisc::rcorr(as.matrix(profile_DEG), type = "spearman")
+index_cor <- caret::findCorrelation(feature_cor$r, cutoff = 0.75, verbose = TRUE)
+feature_remain <- feature_cor$r[-index_cor, -index_cor]
+profile_remain <- profile_DEG %>% 
+  dplyr::select(all_of(rownames(feature_remain))) 
+```
+
+
++ MergeData 
+
+```{r}
+MergeData <- metadata %>%
+  dplyr::select(SampleID, Group) %>%
+  dplyr::inner_join(profile_remain %>%
+                      tibble::rownames_to_column("SampleID"),
+                    by = "SampleID") %>%
+  tibble::column_to_rownames("SampleID") %>%
+  dplyr::mutate(Group = recode(Group, "Healthy" = "Healthy",
+                               "PAAD" = "PAAD")) %>%
+  dplyr::mutate(Group = factor(Group))
+```
+
+
+## Support Vector Machine
+
++ split data
+```{r}
+set.seed(123)
+trainIndex <- caret::createDataPartition(
+          MergeData$Group, 
+          p = 0.8, 
+          list = FALSE, 
+          times = 1)
+
+trainData <- MergeData[trainIndex, ]
+X_train <- trainData[, -1]
+y_train <- trainData[, 1]
+
+testData <- MergeData[-trainIndex, ]
+X_test <- testData[, -1]
+y_test <- testData[, 1]
+```
+
+
++ Base Model
+```{r}
+set.seed(123)
+base.fit <- e1071::svm(
+  Group ~ .,
+  data = trainData)
+
+base.fit
+```
+
+# RFE
++ feature selection: Recursive Feature Elimination 
+
+1. Rank the importance of all features using the chosen RFE machine learning algorithm.
+
+2. Eliminate the least important feature.
+
+3. Build a model using the remaining features.
+
+4. Repeat steps 1-3 until the desired number of features is reached.
+
+
+
+```{r}
+set.seed(123)
+
+# y_train必须是factor
+y_train <- as.factor(y_train)
+
+# 如果是二分类，建议确认阳性类别在第一个或第二个
+table(y_train)
+
+# ===============================
+# True SVM-RFE function
+# ===============================
+svm_rfe <- function(x, y, sizes = c(1:30, 40, 50, 60),
+                    cost = 1,
+                    nfold = 5,
+                    seed = 123) {
+  
+  set.seed(seed)
+  
+  x <- as.data.frame(x)
+  y <- as.factor(y)
+  
+  features <- colnames(x)
+  ranking <- data.frame(
+    FeatureID = character(),
+    Rank = integer(),
+    Weight = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  step <- 1
+  
+  while(length(features) > min(sizes)) {
+    
+    dat <- data.frame(Class = y, x[, features, drop = FALSE])
+    
+    fit <- e1071::svm(
+      Class ~ .,
+      data = dat,
+      kernel = "linear",
+      cost = cost,
+      scale = TRUE
+    )
+    
+    # 计算线性SVM权重：w = t(coefs) %*% SV
+    w <- t(fit$coefs) %*% fit$SV
+    w <- as.numeric(w)
+    names(w) <- features
+    
+    weight_score <- w^2
+    
+    # 删除权重最小的一个特征
+    remove_feature <- names(which.min(weight_score))
+    
+    ranking <- rbind(
+      ranking,
+      data.frame(
+        FeatureID = remove_feature,
+        Rank = length(features),
+        Weight = weight_score[remove_feature]
+      )
+    )
+    
+    features <- setdiff(features, remove_feature)
+    step <- step + 1
+  }
+  
+  # 剩余特征也加入ranking，权重越大越靠前
+  dat <- data.frame(Class = y, x[, features, drop = FALSE])
+  fit <- e1071::svm(
+    Class ~ .,
+    data = dat,
+    kernel = "linear",
+    cost = cost,
+    scale = TRUE
+  )
+  
+  w <- t(fit$coefs) %*% fit$SV
+  w <- as.numeric(w)
+  names(w) <- features
+  weight_score <- sort(w^2, decreasing = FALSE)
+  
+  remaining_rank <- data.frame(
+    FeatureID = names(weight_score),
+    Rank = seq(length(features), 1),
+    Weight = as.numeric(weight_score)
+  )
+  
+  ranking <- rbind(ranking, remaining_rank)
+  
+  # 最终排序：Rank越小越重要
+  ranking <- ranking %>%
+    arrange(Rank)
+  
+  # ===============================
+  # 交叉验证不同特征数量
+  # ===============================
+  folds <- createFolds(y, k = nfold, returnTrain = FALSE)
+  
+  cv_results <- data.frame()
+  
+  for(size in sizes) {
+    
+    selected_features <- ranking$FeatureID[1:size]
+    
+    auc_vec <- c()
+    acc_vec <- c()
+    sens_vec <- c()
+    spec_vec <- c()
+    
+    for(i in seq_along(folds)) {
+      
+      test_idx <- folds[[i]]
+      train_idx <- setdiff(seq_along(y), test_idx)
+      
+      x_tr <- x[train_idx, selected_features, drop = FALSE]
+      y_tr <- y[train_idx]
+      x_te <- x[test_idx, selected_features, drop = FALSE]
+      y_te <- y[test_idx]
+      
+      dat_tr <- data.frame(Class = y_tr, x_tr)
+      dat_te <- data.frame(x_te)
+      
+      fit_cv <- e1071::svm(
+        Class ~ .,
+        data = dat_tr,
+        kernel = "linear",
+        cost = cost,
+        scale = TRUE,
+        probability = TRUE
+      )
+      
+      pred_class <- predict(fit_cv, dat_te)
+      pred_prob <- attr(predict(fit_cv, dat_te, probability = TRUE), "probabilities")
+      
+      # 取第二个level作为阳性类，如果你的PDAC不是第二个，请修改这里
+      positive_class <- levels(y)[2]
+      prob_pos <- pred_prob[, positive_class]
+      
+      roc_obj <- pROC::roc(
+        response = y_te,
+        predictor = prob_pos,
+        levels = levels(y),
+        direction = "<",
+        quiet = TRUE
+      )
+      
+      cm <- caret::confusionMatrix(
+        pred_class,
+        y_te,
+        positive = positive_class
+      )
+      
+      auc_vec <- c(auc_vec, as.numeric(pROC::auc(roc_obj)))
+      acc_vec <- c(acc_vec, cm$overall["Accuracy"])
+      sens_vec <- c(sens_vec, cm$byClass["Sensitivity"])
+      spec_vec <- c(spec_vec, cm$byClass["Specificity"])
+    }
+    
+    cv_results <- rbind(
+      cv_results,
+      data.frame(
+        Variables = size,
+        AUC = mean(auc_vec, na.rm = TRUE),
+        Accuracy = mean(acc_vec, na.rm = TRUE),
+        Sensitivity = mean(sens_vec, na.rm = TRUE),
+        Specificity = mean(spec_vec, na.rm = TRUE),
+        AUCSD = sd(auc_vec, na.rm = TRUE),
+        AccuracySD = sd(acc_vec, na.rm = TRUE)
+      )
+    )
+  }
+  
+  best_size <- cv_results$Variables[which.max(cv_results$AUC)]
+  selected_features <- ranking$FeatureID[1:best_size]
+  
+  final_fit <- e1071::svm(
+    Class ~ .,
+    data = data.frame(Class = y, x[, selected_features, drop = FALSE]),
+    kernel = "linear",
+    cost = cost,
+    scale = TRUE,
+    probability = TRUE
+  )
+  
+  return(list(
+    ranking = ranking,
+    results = cv_results,
+    best_size = best_size,
+    selected_features = selected_features,
+    final_fit = final_fit
+  ))
+}
+
+fs_rfe <- svm_rfe(
+  x = X_train,
+  y = y_train,
+  sizes = c(1:30, 40, 50, 60),
+  cost = 1,
+  nfold = 5,
+  seed = 123
+)
+
+print(fs_rfe$best_size)
+
+rfe_imp <- fs_rfe$results
+p <- ggplot(rfe_imp, aes(x = Variables, y = AUC)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  labs(
+    x = "Number of features",
+    y = "Cross-validated AUC",
+    title = "SVM-RFE feature selection")
+print(p)
+ggsave(paste0(pref_plot, "optimal_feature.pdf"), p, width = 5, height = 10, dpi = 600)
+
+feature_rfe <- fs_rfe$selected_features
+imp_dat <- fs_rfe$ranking %>%
+  filter(FeatureID %in% feature_rfe) %>%
+  mutate(Importance = 1 / Rank) %>%
+  arrange(Rank)
+write.csv(imp_dat, paste0(pref, "_SVM_feature.csv"), row.names = F)
+```
+# Final model of selected features
++ Selected features by rfe
+```{r} 
+trainData_select <- trainData %>%
+  dplyr::select(all_of(c("Group", feature_rfe)))
+X_train_select <- trainData_select[, -1]
+y_train_select <- trainData_select[, 1]
+
+testData_select <- testData %>%
+  dplyr::select(all_of(c("Group", feature_rfe)))
+X_test_select <- testData_select[, -1]
+y_test_select <- testData_select[, 1]
+```
+
+
++ Tune parameters:  
+
+  - sigma
+  
+  - C
+  
+```{r}
+myControl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  search = "random",
+  summaryFunction = twoClassSummary,  
+  classProbs = TRUE,
+  verboseIter = TRUE,
+  allowParallel = TRUE)
+
+# tuning parameters
+tuneGrid <- expand.grid(
+  sigma= 2^c(-25, -20, -15,-10, -5, 0), 
+  C = 2^c(0:5))
+
+set.seed(123)
+tune_fit <- train(
+  Group ~.,
+  data = trainData_select,
+  method = "svmRadial",
+  trControl = myControl,
+  tuneGrid = tuneGrid)
+
+## Plot model accuracy vs different values of Cost
+print(plot(tune_fit))
+
+## Print the best tuning parameter that maximizes model accuracy
+optimalVar <- data.frame(tune_fit$results[which.max(tune_fit$results[, 3]), ])
+print(optimalVar)
+
+# save(tune_fit, file = paste0(pref, "_SVM_tuneFit.RData"))
+```
+
++ building model
+```{r}
+set.seed(123)
+svm_fit_optimal <- e1071::svm(
+  Group ~ ., 
+  data = trainData_select, 
+  kernel = "radial",
+  metric = "ROC",
+  gamma = optimalVar$sigma,
+  cost = optimalVar$C,
+  summaryFunction = twoClassSummary,  
+  probability = TRUE)
+# svm_fit_optimal
+```
+
+
+
++ Confusion matrix
+
+```{r}
+group_names <- grp_names
+pred_raw <- predict(svm_fit_optimal, newdata = X_test_select, type = "response")
+print(caret::confusionMatrix(pred_raw, testData_select$Group))
+pred_prob_temp <- predict(svm_fit_optimal, newdata = X_test_select, probability = TRUE)
+pred_prob <- attr(pred_prob_temp, "probabilities")
+```
+
+
++ ROC
+
+```{r}
+AUROC_res <- AUROC(
+    DataTest = testData_select, 
+    PredProb = pred_prob, 
+    label = group_names[1], 
+    DataProf = fs_rfe$best_size)
+AUROC_res$roc_pl
+save(AUROC_res, file = paste0(pref, "_SVM_AUROC.RData"))
+ggsave(paste0(pref_plot, "ROC.pdf"), AUROC_res$roc_pl, width = 5, height = 4, dpi = 600)
+```
+
+
+# Final profile
+```{r}
+profile_SVM <- profile[pmatch(feature_rfe, rownames(profile)), ]
+write.table(profile_SVM, paste0(pref, "_SVM_profile.tsv"), row.names = T, sep = "\t", quote = F)
+```
+
+## Session info
+```{r}
+devtools::session_info()
+```
+
+
+## Reference 
+
++ [Feature Selection with the Caret R Package](https://machinelearningmastery.com/feature-selection-with-the-caret-r-package/)
+
++ [Feature selection in r](https://jtr13.github.io/cc21fall2/feature-selection-in-r.html)
+
++ [Example for svm feature selection in R](https://stackoverflow.com/questions/17529537/example-for-svm-feature-selection-in-r)
+
++ [Cannot compute probabilities in SVM?](https://stackoverflow.com/questions/13908267/cannot-compute-probabilities-in-svm)

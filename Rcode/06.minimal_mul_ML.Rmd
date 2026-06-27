@@ -1,0 +1,280 @@
+---
+title: "06.minimal_mul_ML_revised_compact"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+set.seed(123)
+```
+
+# 1. Project paths and import data
+
+```{r}
+## ==========================================================
+## Project paths
+## ==========================================================
+project_dir  <- "../../Result"
+jiabo_dir    <- file.path(project_dir, "JiaBo")
+exp_dir      <- file.path(jiabo_dir, "1exp")
+deg_dir      <- file.path(jiabo_dir, "2DEG")
+ml_dir       <- file.path(jiabo_dir, "3ML")
+external_dir <- file.path(project_dir, "External")
+figure_dir   <- file.path(jiabo_dir, "figure/ML2")
+table_dir    <- file.path(jiabo_dir, "table")
+
+source("../functions.R")
+source("./single_marker_AUC_barplot.R")
+source("./utilities.R")
+source("./minimal_mul_ML.R")
+load_required_packages()
+create_project_dirs(figure_dir, table_dir)
+
+positive_class <- "PAAD"
+negative_class <- "Healthy"
+discovery_item <- "tis"
+
+## ==========================================================
+## Input data
+## ==========================================================
+common_feat_exo <- read.csv(file.path(ml_dir, "common_feat.csv"))$gene
+
+tis_deg <- read.csv(file.path(deg_dir, "03_Main_DEG_same_direction_in_TCGA_NAT.csv")) %>%
+  Define_Change(., "adjP_main", "logFC_main")
+
+common_feat_up <- dplyr::filter(tis_deg, change == "Up")$Gene %>% intersect(common_feat_exo)
+common_feat_dw <- dplyr::filter(tis_deg, change == "Down")$Gene %>% intersect(common_feat_exo)
+
+exo_raw <- load_discovery_rdata(file.path(exp_dir, "exo.RData"))
+tis_raw <- load_discovery_rdata(file.path(exp_dir, "tis.RData"))
+
+profile_exo  <- exo_raw$profile
+metadata_exo <- exo_raw$metadata
+profile_tis  <- tis_raw$profile
+metadata_tis <- tis_raw$metadata
+```
+
+# 2. Prepare TIS and EXO discovery data
+
+```{r}
+# Use the 12 concordantly up-regulated genes from the common feature panel.
+panel_genes <- common_feat_up
+
+TIS_MergeData <- prepare_model_data(
+  profile = profile_tis,
+  metadata = metadata_tis,
+  genes = panel_genes,
+  negative = negative_class,
+  positive = positive_class
+)
+
+EXO_MergeData <- prepare_model_data(
+  profile = profile_exo,
+  metadata = metadata_exo,
+  genes = panel_genes,
+  negative = negative_class,
+  positive = positive_class
+)
+
+# TIS is used for minimal multigene classifier optimization and tissue-model validation.
+TIS_split <- split_discovery_data(TIS_MergeData, p = 0.8, seed = 123)
+TIS_train_all <- TIS_split$train
+TIS_test_all  <- TIS_split$test
+
+# EXO is used for compartment-specific plasma/exosome ERS evaluation.
+EXO_split <- split_discovery_data(EXO_MergeData, p = 0.8, seed = 123)
+EXO_train_all <- EXO_split$train
+EXO_test_all  <- EXO_split$test
+
+cat("TIS discovery data:", nrow(TIS_MergeData), "samples and", ncol(TIS_MergeData) - 1, "genes\n")
+cat("EXO discovery data:", nrow(EXO_MergeData), "samples and", ncol(EXO_MergeData) - 1, "genes\n")
+```
+
+# 3. Minimal multigene classifier optimization based on TIS
+
+```{r}
+candidate_sets <- get_default_candidate_sets() %>% filter_candidate_sets(TIS_MergeData)
+
+optimization_res <- run_minimal_optimization(
+  candidate_sets = candidate_sets,
+  trainData_all = TIS_train_all,
+  testData_all = TIS_test_all,
+  positive = positive_class,
+  negative = negative_class,
+  seed = 123
+)
+
+print(optimization_res)
+save_csv(
+  optimization_res,
+  out_dir = table_dir,
+  filename = paste0("multigene_classifier_optimization_", discovery_item, ".csv")
+)
+
+p_opt <- plot_optimization_results(
+  optimization_res,
+  title = paste0("Minimal multigene classifier optimization: ", toupper(discovery_item))
+)
+print(p_opt)
+ggplot2::ggsave(
+  filename = file.path(figure_dir, paste0("multigene_classifier_optimization_", discovery_item, ".pdf")),
+  plot = p_opt,
+  width = 8,
+  height = 6
+)
+```
+
+# 4. Final 3-gene ERS genes
+
+```{r}
+final_ers_genes <- c("LCN2", "LRRC42", "FLOT1")
+final_ers_genes <- intersect(final_ers_genes, colnames(TIS_MergeData))
+stopifnot(length(final_ers_genes) >= 2)
+
+TIS_train <- TIS_train_all[, c("Group", final_ers_genes), drop = FALSE]
+TIS_test  <- TIS_test_all[, c("Group", final_ers_genes), drop = FALSE]
+EXO_train <- EXO_train_all[, c("Group", final_ers_genes), drop = FALSE]
+EXO_test  <- EXO_test_all[, c("Group", final_ers_genes), drop = FALSE]
+```
+
+# 5. Tissue ERS model and external tissue validation
+
+```{r}
+TIS_fit <- fit_ers_models(
+  trainData = TIS_train,
+  genes = final_ers_genes,
+  positive = positive_class,
+  seed = 123,
+  tune_svm = TRUE
+)
+
+TIS_model_list <- TIS_fit$models
+
+external_paths <- build_external_paths(
+  external_dir = external_dir,
+  cohort_names = c("GSE28735", "GSE62452", "GSE71729")
+)
+
+external_cohorts <- load_external_cohorts(
+  external_paths = external_paths,
+  genes = final_ers_genes,
+  negative = negative_class,
+  positive = positive_class
+)
+
+TIS_validation_cohorts <- c(
+  list(Training = TIS_train, Internal_test = TIS_test),
+  external_cohorts
+)
+
+TIS_performance_obj <- make_performance_table(
+  model_list = TIS_model_list,
+  all_cohorts = TIS_validation_cohorts,
+  trainData = TIS_train,
+  genes = final_ers_genes,
+  positive = positive_class,
+  negative = negative_class,
+  model_domain = "Tissue-trained ERS"
+)
+```
+
+# 6. Plasma/exosome ERS model evaluation
+
+```{r}
+# The ERS genes are fixed, but classifier coefficients are trained within the EXO compartment.
+EXO_fit <- fit_ers_models(
+  trainData = EXO_train,
+  genes = final_ers_genes,
+  positive = positive_class,
+  seed = 123,
+  tune_svm = TRUE
+)
+
+EXO_model_list <- EXO_fit$models
+
+EXO_validation_cohorts <- list(
+  EXO_training = EXO_train,
+  EXO_internal_test = EXO_test
+)
+
+EXO_performance_obj <- make_performance_table(
+  model_list = EXO_model_list,
+  all_cohorts = EXO_validation_cohorts,
+  trainData = EXO_train,
+  genes = final_ers_genes,
+  positive = positive_class,
+  negative = negative_class,
+  model_domain = "Plasma/exosome-trained ERS"
+)
+```
+
+# 7. Performance tables requested by reviewer
+
+```{r}
+performance_table <- dplyr::bind_rows(
+  TIS_performance_obj$full,
+  EXO_performance_obj$full
+)
+
+performance_table_for_manuscript <- dplyr::bind_rows(
+  TIS_performance_obj$manuscript,
+  EXO_performance_obj$manuscript
+)
+
+thresholds <- list(
+  Tissue = TIS_performance_obj$thresholds,
+  EXO = EXO_performance_obj$thresholds
+)
+
+print(thresholds)
+print(performance_table_for_manuscript)
+
+save_csv(
+  performance_table,
+  out_dir = table_dir,
+  filename = "ERS_classifier_performance_full.csv"
+)
+
+save_csv(
+  performance_table_for_manuscript,
+  out_dir = table_dir,
+  filename = "ERS_classifier_performance_table_for_manuscript.csv"
+)
+```
+
+# 8. ROC plots for tissue and plasma/exosome compartments
+
+```{r}
+TIS_roc_plot_list <- save_roc_plots(
+  roc_cohorts = TIS_validation_cohorts,
+  model_list = TIS_model_list,
+  genes = final_ers_genes,
+  out_dir = figure_dir,
+  prefix = "ROC_tissue_trained_ERS",
+  positive = positive_class,
+  negative = negative_class,
+  plot_title_prefix = "tissue-trained ERS"
+)
+
+EXO_roc_plot_list <- save_roc_plots(
+  roc_cohorts = EXO_validation_cohorts,
+  model_list = EXO_model_list,
+  genes = final_ers_genes,
+  out_dir = figure_dir,
+  prefix = "ROC_plasma_exosome_trained_ERS",
+  positive = positive_class,
+  negative = negative_class,
+  plot_title_prefix = "plasma/exosome-trained ERS"
+)
+
+for (nm in names(TIS_roc_plot_list)) print(TIS_roc_plot_list[[nm]])
+for (nm in names(EXO_roc_plot_list)) print(EXO_roc_plot_list[[nm]])
+```
+
+# Session info
+
+```{r}
+devtools::session_info()
+```

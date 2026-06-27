@@ -1,0 +1,83 @@
+---
+title: "01.DEGs_venn.Rmd"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(data.table)
+library(tibble)
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(glmnet)
+library(venn)
+library(VennDiagram)
+library(ggVennDiagram)
+library(ggvenn)
+library(patchwork)
+library(ComplexHeatmap)
+library(colorRamp2)
+library(clusterProfiler)
+# library(enrichR)
+rm(list = ls())
+```
+
+# load data
+```{r}
+source("../functions.R")
+source("./utilities.R")
+exo_res <- read.csv("../../Result/DE/DEG_exo_limma.csv") %>% Define_Change(., "AdjustedPvalue", "logFC")
+tis_res <- read.csv("../../Result/JiaBo/2DEG/03_Main_DEG_same_direction_in_TCGA_NAT.csv") %>% Define_Change(., "adjP_main", "logFC_main")
+exo <- exo_res %>% dplyr::select(c("FeatureID", "change"))
+tis <- tis_res %>% dplyr::select(c("Gene", "change"))
+fig_plot <- "../../Result/JiaBo/figure/"
+res_plot <- "../../Result/JiaBo/2DEG/"
+```
+
+# venn
+```{r}
+venn_list1 <- list(set1 = (filter(exo, change == "Up"))$FeatureID, 
+               set2 = (filter(tis, change == "Up"))$Gene)
+names(venn_list1) <- c("exo_up", "tis_up")
+
+venn_list2 <- list(set1 = (filter(exo, change == "Down"))$FeatureID,
+               set2 = (filter(tis, change == "Down"))$Gene)
+names(venn_list2) <- c("exo_dw", "tis_dw")
+
+up_cols = c("#b2abd2","#542788") #  c("#ffd166","#f45b69") 
+p1 <- ggvenn(venn_list1, c("exo_up","tis_up"),
+             show_percentage = FALSE,
+             stroke_color = "white",
+             fill_color = up_cols,
+             set_name_color = up_cols)
+p1
+
+dw_cols = c("#4393c3","#2166ac") #  c("#1a9850", "#4281a4")
+p2 <- ggvenn(venn_list2, c("exo_dw","tis_dw"),
+             show_percentage = FALSE,
+             stroke_color = "white",
+             fill_color = dw_cols,
+             set_name_color = dw_cols)
+p2
+
+pref_plot <- paste0(fig_plot, "DEGs_venn")
+pdf(paste0(pref_plot, "_up.pdf"), width = 6, height = 10)
+print(p1)
+dev.off()
+f2g(paste0(pref_plot, "_up.pdf"), paste0(pref_plot, "_up.png"))
+
+pref_plot <- paste0(fig_plot, "DEGs_venn")
+pdf(paste0(pref_plot, "_down.pdf"), width = 6, height = 10)
+print(p2)
+dev.off()
+f2g(paste0(pref_plot, "_down.pdf"), paste0(pref_plot, "_down.png"))
+
+overlap_up <- intersect((filter(exo, change == "Up"))$FeatureID, (filter(tis, change == "Up"))$Gene)
+overlap_dw <- intersect((filter(exo, change == "Down"))$FeatureID, (filter(tis, change == "Down"))$Gene)
+overlap_genes <- c(overlap_up, overlap_dw)
+save(overlap_up, overlap_dw, overlap_genes, file = paste0(res_plot, "overlap_genes.rda"))
+c("LCN2", "FLOT1", "LRRC42") %in% overlap_up
+```
+
